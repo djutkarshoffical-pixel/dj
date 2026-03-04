@@ -12,6 +12,8 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.6.10/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.6.10/firebase-database-compat.js"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
 
@@ -1341,6 +1343,10 @@
                     </div>
                     <div
                         style="text-align:right; font-family:'Outfit',sans-serif; position: relative; display: flex; align-items: center; gap: 20px;">
+                        <span id="cloudStatus"
+                            style="font-size: 10px; color: #22c55e; font-weight: 700; background: rgba(34,197,94,0.1); padding: 4px 8px; border-radius: 20px; border: 1px solid rgba(34,197,94,0.3); display: flex; align-items:center; gap: 5px;">
+                            <i class="fa-solid fa-cloud" style="font-size: 12px;"></i> CLOUD SYNC ACTIVE
+                        </span>
                         <div id="accessNotifyBtn" style="cursor: pointer; position: relative; display: none;"
                             onclick="toggleAccessPanel()">
                             <i class="fa-solid fa-bell" style="font-size: 20px; color: #475569;"></i>
@@ -2310,6 +2316,9 @@
         // --- AUTH LOGIC (MOCK) ---
         window.usersDB = JSON.parse(localStorage.getItem('usersDB') || '{}');
         let currentLoggedInUser = '';
+        const firebaseConfig = { databaseURL: "https://predictx-sales-default-rtdb.firebaseio.com/" };
+        firebase.initializeApp(firebaseConfig);
+        const fbDB = firebase.database();
 
         function saveUsersDB() {
             localStorage.setItem('usersDB', JSON.stringify(window.usersDB));
@@ -2709,6 +2718,9 @@
                 // Load and Sync Profile Data
                 syncProfileView();
 
+                // Initialize Firebase Cloud Listeners
+                initCloudListeners();
+
                 // Hide login, show app
                 document.getElementById('loginScreen').style.display = 'none';
                 document.getElementById('appScreen').style.display = 'flex';
@@ -2847,6 +2859,18 @@
                 // IMMEDIATE SYNC: Load Admin's data even before/during approval
                 loadSharedSalesData();
 
+                // Cloud Sync: Listen for approval if we have a requestId
+                const requestId = params.get('id');
+                if (requestId) {
+                    fbDB.ref('approvals/' + requestId).on('value', (snapshot) => {
+                        if (snapshot.val() === true) {
+                            document.getElementById('viewerOverlay').style.display = 'none';
+                            document.body.classList.remove('viewer-mode');
+                            localStorage.setItem('accessApprovals', JSON.stringify({ [requestId]: true }));
+                        }
+                    });
+                }
+
                 // Hide sidebar ONLY until approval
                 document.querySelector('.sidebar').style.display = 'none';
                 document.querySelector('.main-content').style.marginLeft = '0';
@@ -2980,6 +3004,26 @@
             }
         }
 
+        // --- ACCESS & DEVICE DETECTION ---
+        function getDeviceName() {
+            const ua = navigator.userAgent;
+            if (/android/i.test(ua)) {
+                // Try to extract the device model
+                const match = ua.match(/\(([^;]+);/);
+                if (match && match[1]) {
+                    const parts = match[1].split(';');
+                    const model = parts[parts.length - 1].trim();
+                    if (model.includes('Build')) return model.split('Build')[0].trim();
+                    return model;
+                }
+                return "Android Mobile";
+            }
+            if (/iPad|iPhone|iPod/.test(ua)) return "iOS Device";
+            if (/Windows/.test(ua)) return "Windows PC";
+            if (/Macintosh/.test(ua)) return "Macbook/Mac";
+            return "PC Browser";
+        }
+
         function requestAccess() {
             const btn = document.getElementById('requestBtn');
             btn.innerHTML = '<i class="fa-solid fa-hourglass-half"></i> Requesting...';
@@ -2987,10 +3031,30 @@
 
             const params = new URLSearchParams(window.location.search);
             const requestId = params.get('id') || 'guest';
+            const adminId = params.get('admin') || 'guest';
+            const deviceName = getDeviceName();
 
-            const requests = JSON.parse(localStorage.getItem('accessRequests') || '[]');
-            requests.push({ id: requestId, time: new Date().toLocaleTimeString(), name: 'Guest Viewer' });
-            localStorage.setItem('accessRequests', JSON.stringify(requests));
+            const requestData = {
+                id: requestId,
+                time: new Date().toLocaleTimeString(),
+                name: deviceName,
+                fullLabel: `${deviceName} (${requestId.substr(0, 4).toUpperCase()})`,
+                admin: adminId,
+                status: 'pending'
+            };
+
+            // Push to Firebase Cloud (Real-time Sync)
+            fbDB.ref('requests/' + adminId + '/' + requestId).set(requestData);
+
+            // Listen for Cloud Approval
+            fbDB.ref('approvals/' + requestId).on('value', (snapshot) => {
+                if (snapshot.val() === true) {
+                    document.getElementById('viewerOverlay').style.display = 'none';
+                    document.body.classList.remove('viewer-mode');
+                    localStorage.setItem('accessApprovals', JSON.stringify({ [requestId]: true }));
+                    alert("Access Granted by Administrator!");
+                }
+            });
 
             document.getElementById('viewerStatus').innerHTML = "Request merit! Administrator ko message bhej diya gaya hai. <br>Jaise hi wo approve karenge, dashboard unlock ho jayega.";
         }
@@ -3001,31 +3065,55 @@
             updateRequestsUI();
         }
 
-        function updateRequestsUI() {
-            const requests = JSON.parse(localStorage.getItem('accessRequests') || '[]');
+        function updateRequestsUI(cloudRequests = null) {
+            // If cloudRequests is provided (from Firebase), use it. Otherwise fallback to Local
+            const requests = cloudRequests || JSON.parse(localStorage.getItem('accessRequests') || '[]');
             const list = document.getElementById('requestsList');
             const badge = document.getElementById('notifCount');
             const btn = document.getElementById('accessNotifyBtn');
 
             if (requests.length > 0) {
-                btn.style.display = 'flex';
-                badge.innerText = requests.length;
+                if (btn) btn.style.display = 'flex';
+                if (badge) badge.innerText = requests.length;
                 list.innerHTML = requests.map((req, index) => `
                     <div style="padding: 10px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center;">
                         <div>
-                            <div style="font-weight: 600; font-size: 13px;">${req.name}</div>
-                            <div style="font-size: 11px; color: #888;">${req.time}</div>
+                            <div style="font-weight: 600; font-size: 13px; color: #1e293b;">
+                                <i class="fa-solid fa-mobile-screen-button" style="margin-right:5px; color:var(--orange);"></i>
+                                ${req.fullLabel || req.name}
+                            </div>
+                            <div style="font-size: 11px; color: #64748b;">${req.time}</div>
                         </div>
-                        <button class="btn btn-blue-sm" style="padding: 5px 10px; font-size: 11px;" onclick="approveAccess('${req.id}', ${index})">Approve</button>
+                        <div style="display:flex; gap:5px;">
+                            <button class="btn btn-blue-sm" style="padding: 4px 8px; font-size: 10px;" onclick="approveAccess('${req.id}', ${index}, '${req.admin}')">Approve</button>
+                            <button class="btn" style="background:#ef4444; color:white; padding: 4px 8px; font-size: 10px; border:none;" onclick="rejectRequest(${index}, '${req.id}', '${req.admin}')">Reject</button>
+                        </div>
                     </div>
                 `).join('');
             } else {
                 list.innerHTML = '<p style="color: #888; font-size: 13px; text-align: center;">No pending requests</p>';
                 if (btn) btn.style.display = 'none';
+                if (badge) badge.innerText = '0';
             }
         }
 
-        function approveAccess(id, index) {
+        function rejectRequest(index, requestId, adminId) {
+            if (!confirm("Reject this access request?")) return;
+
+            // 1. Local Update
+            const requests = JSON.parse(localStorage.getItem('accessRequests') || '[]');
+            requests.splice(index, 1);
+            localStorage.setItem('accessRequests', JSON.stringify(requests));
+
+            // 2. Cloud Update
+            if (requestId && adminId) {
+                fbDB.ref('requests/' + adminId + '/' + requestId).remove();
+            }
+            updateRequestsUI();
+        }
+
+        function approveAccess(id, index, adminId) {
+            // 1. Local Approval
             const approvals = JSON.parse(localStorage.getItem('accessApprovals') || '{}');
             approvals[id] = true;
             localStorage.setItem('accessApprovals', JSON.stringify(approvals));
@@ -3034,9 +3122,32 @@
             requests.splice(index, 1);
             localStorage.setItem('accessRequests', JSON.stringify(requests));
 
-            alert("Access Approved Successfully!");
+            // 2. Cloud Approval (Real-time Sync)
+            fbDB.ref('approvals/' + id).set(true);
+            if (adminId) {
+                fbDB.ref('requests/' + adminId + '/' + id).remove();
+            }
+
             updateRequestsUI();
-            if (requests.length === 0) toggleAccessPanel();
+            alert("Viewer approved successfully!");
+        }
+
+        // --- NEW: CLOUD LISTENER FOR ADMIN ---
+        function initCloudListeners() {
+            if (!currentLoggedInUser || document.body.classList.contains('viewer-mode')) return;
+
+            fbDB.ref('requests/' + currentLoggedInUser).on('value', (snapshot) => {
+                const data = snapshot.val();
+                if (data) {
+                    const cloudRequests = Object.values(data);
+                    // Sync local with cloud to ensure UI consistency
+                    localStorage.setItem('accessRequests', JSON.stringify(cloudRequests));
+                    updateRequestsUI(cloudRequests);
+                } else {
+                    localStorage.setItem('accessRequests', JSON.stringify([]));
+                    updateRequestsUI([]);
+                }
+            });
         }
 
         // Update Presence UI on Admin Dashboard
@@ -4274,6 +4385,5 @@
         </div>
     </div>
 </body>
-
 
 </html>
