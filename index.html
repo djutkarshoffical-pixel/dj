@@ -2320,6 +2320,21 @@
         firebase.initializeApp(firebaseConfig);
         const fbDB = firebase.database();
 
+        // New Connectivity Checker
+        fbDB.ref('.info/connected').on('value', (snapshot) => {
+            const statusEl = document.getElementById('cloudStatus');
+            if (!statusEl) return;
+            if (snapshot.val() === true) {
+                statusEl.innerHTML = '<i class="fa-solid fa-cloud"></i> CLOUD SYNC ACTIVE';
+                statusEl.style.color = '#22c55e';
+                statusEl.style.background = 'rgba(34,197,94,0.1)';
+            } else {
+                statusEl.innerHTML = '<i class="fa-solid fa-cloud-slash"></i> SYNCING... (OFFLINE)';
+                statusEl.style.color = '#ef4444';
+                statusEl.style.background = 'rgba(239,68,68,0.1)';
+            }
+        });
+
         function saveUsersDB() {
             localStorage.setItem('usersDB', JSON.stringify(window.usersDB));
         }
@@ -2686,6 +2701,7 @@
 
             if (user.trim() !== '' && pass.trim() !== '') {
                 currentLoggedInUser = user;
+                localStorage.setItem('currentLoggedInUser', user); // Persistent Session
                 // Construct user object or fallback to dummy info
                 if (!window.usersDB[user]) {
                     window.usersDB[user] = { name: user, mobile: 'Not Provided', role: 'System Admin', history: [] };
@@ -2736,6 +2752,8 @@
         function handleLogout(event) {
             event.stopPropagation(); // Prevents toggle from firing again
             if (confirm("Are you sure you want to log out of the Sales Forecasting System?")) {
+                localStorage.removeItem('currentLoggedInUser');
+                currentLoggedInUser = '';
                 // Reset to login screen
                 document.getElementById('appScreen').style.display = 'none';
                 document.getElementById('loginScreen').style.display = 'flex';
@@ -2861,13 +2879,25 @@
 
                 // Cloud Sync: Listen for approval if we have a requestId
                 const requestId = params.get('id');
-                if (requestId) {
+                if (requestId && targetAdminForGuest) {
                     fbDB.ref('approvals/' + requestId).on('value', (snapshot) => {
-                        if (snapshot.val() === true) {
+                        const approved = snapshot.val() === true;
+                        if (approved) {
                             document.getElementById('viewerOverlay').style.display = 'none';
                             document.body.classList.remove('viewer-mode');
-                            localStorage.setItem('accessApprovals', JSON.stringify({ [requestId]: true }));
+                            const approvals = JSON.parse(localStorage.getItem('accessApprovals') || '{}');
+                            approvals[requestId] = true;
+                            localStorage.setItem('accessApprovals', JSON.stringify(approvals));
                         }
+
+                        // Sync Presence to Cloud
+                        fbDB.ref('presence/' + targetAdminForGuest + '/' + requestId).set({
+                            name: getDeviceName(),
+                            lastSeen: Date.now(),
+                            isApproved: approved,
+                            admin: targetAdminForGuest
+                        });
+                        fbDB.ref('presence/' + targetAdminForGuest + '/' + requestId).onDisconnect().remove();
                     });
                 }
 
@@ -3136,11 +3166,11 @@
         function initCloudListeners() {
             if (!currentLoggedInUser || document.body.classList.contains('viewer-mode')) return;
 
+            // 1. Listen for Access Requests
             fbDB.ref('requests/' + currentLoggedInUser).on('value', (snapshot) => {
                 const data = snapshot.val();
                 if (data) {
                     const cloudRequests = Object.values(data);
-                    // Sync local with cloud to ensure UI consistency
                     localStorage.setItem('accessRequests', JSON.stringify(cloudRequests));
                     updateRequestsUI(cloudRequests);
                 } else {
@@ -3148,19 +3178,36 @@
                     updateRequestsUI([]);
                 }
             });
+
+            // 2. Listen for Guest Presence (Live Sessions)
+            fbDB.ref('presence/' + currentLoggedInUser).on('value', (snapshot) => {
+                const data = snapshot.val();
+                if (data) {
+                    updatePresenceUI(data);
+                } else {
+                    updatePresenceUI({});
+                }
+            });
         }
 
         // Update Presence UI on Admin Dashboard
-        function updatePresenceUI() {
+        function updatePresenceUI(cloudPresence = null) {
             const list = document.getElementById('activeGuestList');
             if (!list || document.body.classList.contains('viewer-mode')) return;
 
-            const presence = JSON.parse(localStorage.getItem('guestPresence') || '{}');
+            // Use cloud data if provided, otherwise fallback to local
+            const presence = cloudPresence || JSON.parse(localStorage.getItem('guestPresence') || '{}');
             const now = Date.now();
             let html = '';
             let hasActive = false;
 
-            for (const [id, data] of Object.entries(presence)) {
+            // Check if presence is an object (Firebase format) or array
+            const presenceEntries = Array.isArray(presence) ? presence : Object.entries(presence);
+
+            for (const item of presenceEntries) {
+                const data = Array.isArray(item) ? item[1] : item;
+                const id = Array.isArray(item) ? item[0] : (data.id || 'guest');
+
                 // Filter by current admin AND only show if they are approved
                 if (data.admin !== currentLoggedInUser || !data.isApproved) continue;
 
@@ -3171,7 +3218,7 @@
                     <div style="display:flex; align-items:center; justify-content:space-between; padding:8px; background:#f8fafc; border-radius:8px; border:1px solid #e2e8f0;">
                         <div style="display:flex; align-items:center; gap:10px;">
                             <div style="width:10px; height:10px; border-radius:50%; background:${isOnline ? '#22c55e' : '#94a3b8'}; box-shadow: ${isOnline ? '0 0 8px rgba(34,197,94,0.5)' : 'none'};"></div>
-                            <span style="font-size:13px; font-weight:600; color:#1e293b;">${data.name} (${id.substr(0, 4)})</span>
+                            <span style="font-size:13px; font-weight:600; color:#1e293b;">${data.name}</span>
                         </div>
                         <span style="font-size:11px; color:${isOnline ? '#22c55e' : '#64748b'}; font-weight:700;">${isOnline ? 'ONLINE' : 'OFFLINE'}</span>
                     </div>
@@ -4346,8 +4393,20 @@
             alert('Simulation applied to chart!');
         }
 
-        // Intialize on load (chart is initialized on login)
+        // Intialize on load
         window.onload = function () {
+            // Restore Session
+            const savedUser = localStorage.getItem('currentLoggedInUser');
+            if (savedUser) {
+                currentLoggedInUser = savedUser;
+                document.getElementById('loginScreen').style.display = 'none';
+                document.getElementById('appScreen').style.display = 'flex';
+                const userObj = window.usersDB[savedUser] || { name: savedUser, role: 'System Admin' };
+                document.getElementById('sidebarProfileName').innerText = userObj.name;
+                document.getElementById('sidebarProfileRole').innerText = userObj.role;
+                initCloudListeners();
+            }
+
             updateLiveTime();
             syncProfileView();
             checkViewerMode();
